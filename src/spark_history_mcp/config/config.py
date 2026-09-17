@@ -121,11 +121,24 @@ class YamlConfigSettingsSource(PydanticBaseSettingsSource):
 
 
 class AuthConfig(BaseSettings):
-    """Authentication configuration for the Spark server."""
+    """Authentication configuration for the Spark server.
 
+    ``type`` selects the auth flow explicitly; when ``None``, the flow is
+    inferred from which other fields are set (``username``+``password`` →
+    basic, ``token`` → bearer, ``workload_name`` → CDP workload). Explicit
+    ``type`` is preferred for Cloudera deployments where auto-refresh
+    behaviour differs across flows.
+    """
+
+    type: Optional[Literal["basic", "bearer", "cdp_workload"]] = Field(None)
     username: Optional[str] = Field(None)
     password: Optional[str] = Field(None)
     token: Optional[str] = Field(None)
+    # Cloudera CDP workload service name (e.g. "DE") for
+    # ``cdp iam generate-workload-auth-token --workload-name <name>``.
+    workload_name: Optional[str] = Field(None)
+    # Refresh a CDP workload JWT this many seconds *before* it expires.
+    workload_refresh_skew_seconds: int = Field(120)
     # Ignore unknown keys for compatibility with the shared shs CLI config.
     model_config = SettingsConfigDict(extra="ignore")
 

@@ -12,11 +12,13 @@ application-scoped method takes an optional ``app_attempt_id`` that is composed
 into the application id; omitting it selects the latest/only attempt. There is
 no implicit retry against a hard-coded attempt id.
 
-**Authentication.** Username/password (basic) and bearer tokens are applied as
-an ``Authorization`` header. EMR persistent-UI servers authenticate with a
-session cookie instead: :meth:`configure_cookies` installs a ``Cookie`` header
-on the generated client and an optional re-auth callback that refreshes it when
-a request is rejected with 401/403.
+**Authentication.** Username/password (basic), bearer tokens, and Cloudera
+CDP workload JWTs are applied as an ``Authorization`` header. EMR
+persistent-UI servers authenticate with a session cookie instead:
+:meth:`configure_cookies` installs a ``Cookie`` header on the generated
+client and an optional re-auth callback that refreshes it when a request is
+rejected with 401/403. The same 401/403 path also refreshes CDP workload
+JWTs via :class:`CDPWorkloadTokenProvider`.
 """
 
 import functools
@@ -31,6 +33,7 @@ from spark_history_mcp.api_client.exceptions import (
     NotFoundException,
     UnauthorizedException,
 )
+from spark_history_mcp.auth.cdp_workload import CDPWorkloadTokenProvider
 from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.environment import Environment
 from spark_history_mcp.api_client.models.executor import Executor
@@ -46,6 +49,22 @@ _DEFAULT_QUANTILES = "0.05, 0.25, 0.5, 0.75, 0.95"
 _PROXY_URL = "socks5h://localhost:8157"
 
 
+def _infer_auth_type(auth) -> Optional[str]:
+    """Deduce the auth flow when :attr:`AuthConfig.type` is not set.
+
+    Kept for backward compatibility with configs that predate the explicit
+    ``type`` field. Prefers ``basic`` when both username/password and token
+    are set, matching the existing stock behaviour.
+    """
+    if auth.username and auth.password:
+        return "basic"
+    if auth.workload_name:
+        return "cdp_workload"
+    if auth.token:
+        return "bearer"
+    return None
+
+
 class AttemptRequiredError(Exception):
     """Raised when an application has multiple attempts and none was specified.
 
@@ -59,8 +78,10 @@ class AttemptRequiredError(Exception):
 def _resilient_call(method):
     """Cross-cutting error handling for application-scoped methods.
 
-    * On 401/403, if a re-auth callback is configured, refresh the cookie and
-      retry once (covers EMR session-cookie rotation).
+    * On 401/403, refresh whichever credential is configured and retry once:
+      the EMR cookie callback (``self._reauth``) or the CDP workload token
+      provider (``self._token_provider``). If neither is configured the
+      exception propagates.
     * On 404 with no ``app_attempt_id`` for an app that has named attempts,
       re-raise as :class:`AttemptRequiredError`; otherwise propagate. The
       attempt lookup only happens on the failure path.
@@ -72,10 +93,13 @@ def _resilient_call(method):
         try:
             return method(self, *args, **kwargs)
         except (UnauthorizedException, ForbiddenException):
-            if not self._reauth:
-                raise
-            self._apply_cookie(self._reauth())
-            return method(self, *args, **kwargs)
+            if self._reauth:
+                self._apply_cookie(self._reauth())
+                return method(self, *args, **kwargs)
+            if self._token_provider is not None:
+                self._apply_bearer(self._token_provider.force_refresh())
+                return method(self, *args, **kwargs)
+            raise
         except NotFoundException as exc:
             bound = signature.bind(self, *args, **kwargs)
             bound.apply_defaults()
@@ -111,8 +135,19 @@ class SparkRestClient:
 
         # Optional callback returning a fresh Cookie header (EMR re-auth).
         self._reauth: Optional[Callable[[], str]] = None
+        # Optional CDP workload JWT provider; set when auth.type == cdp_workload.
+        self._token_provider: Optional[CDPWorkloadTokenProvider] = None
 
         self._api = self._build_api_client()
+
+    @property
+    def token_provider(self) -> Optional[CDPWorkloadTokenProvider]:
+        """The CDP workload token provider, if this client has one.
+
+        Exposed so the app lifespan can drive a preemptive refresh loop
+        (see :func:`spark_history_mcp.core.app.app_lifespan`).
+        """
+        return self._token_provider
 
     def _build_api_client(self) -> DefaultApi:
         configuration = Configuration(
@@ -131,18 +166,46 @@ class SparkRestClient:
         api_client = ApiClient(configuration)
 
         # The generated client does not auto-apply auth, so set it explicitly.
+        # Auth flow is chosen from ``auth.type`` when set, otherwise inferred
+        # from which of the credential fields are populated.
         auth = self.config.auth
         if auth:
-            if auth.username and auth.password:
+            flow = auth.type or _infer_auth_type(auth)
+            if flow == "basic" and auth.username and auth.password:
                 configuration.username = auth.username
                 configuration.password = auth.password
                 token = configuration.get_basic_auth_token()
                 if token:
                     api_client.set_default_header("Authorization", token)
-            elif auth.token:
-                api_client.set_default_header("Authorization", f"Bearer {auth.token}")
+            elif flow == "bearer" and auth.token:
+                api_client.set_default_header(
+                    "Authorization", f"Bearer {auth.token}"
+                )
+            elif flow == "cdp_workload":
+                if not auth.workload_name:
+                    raise ValueError(
+                        "auth.type=cdp_workload requires auth.workload_name "
+                        "(e.g. 'DE')."
+                    )
+                self._token_provider = CDPWorkloadTokenProvider(
+                    workload_name=auth.workload_name,
+                    refresh_skew_seconds=auth.workload_refresh_skew_seconds,
+                )
+                # Prime the header — subsequent refreshes reuse
+                # ``_apply_bearer`` on ``self._api.api_client``.
+                self._apply_bearer_to(
+                    api_client, self._token_provider.get_token()
+                )
 
         return DefaultApi(api_client)
+
+    def _apply_bearer(self, token: str) -> None:
+        """Update the ``Authorization`` header after a token refresh."""
+        self._apply_bearer_to(self._api.api_client, token)
+
+    @staticmethod
+    def _apply_bearer_to(api_client: ApiClient, token: str) -> None:
+        api_client.set_default_header("Authorization", f"Bearer {token}")
 
     # ------------------------------------------------------------------
     # Auth / transport configuration

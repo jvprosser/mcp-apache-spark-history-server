@@ -1,0 +1,37 @@
+# Example configuration for Cloudera CDP DataHub with Spark.
+#
+# Documentation copy: at runtime we prefer the SHS_* environment variables
+# so that no secrets or environment-specific paths are committed. This
+# file exists to show the equivalent YAML shape.
+#
+# The DataHub Spark History Server is reached through the Knox gateway.
+# Get the URL from CDP Console -> Data Hub -> <cluster> -> Endpoints ->
+# "Spark History Server". It typically looks like
+#   https://<gateway-host>/<env-name>/cdp-proxy/sparkhistoryserver
+# (some environments append the cluster name to the last segment).
+
+servers:
+  datahub:
+    default: true
+    url: "https://<gateway-host>/<env-name>/cdp-proxy/sparkhistoryserver"
+
+    # Knox presents a cert signed by an internal CA. Point at a PEM bundle
+    # that contains it. Inside a CML runtime, the workspace-wide bundle
+    # usually sits at /etc/ssl/certs/ca-certificates.crt.
+    verify_ssl: true
+    ssl_ca_cert: "/etc/ssl/certs/ca-certificates.crt"
+
+    timeout: 60
+
+    auth:
+      type: cdp_workload
+      # CDP workload service name — confirm with
+      #   cdp iam list-workload-clients
+      # In most DataHub environments this is "DE".
+      workload_name: "DE"
+      # Refresh the JWT this many seconds before it expires.
+      workload_refresh_skew_seconds: 120
+
+mcp:
+  # Agent Studio only supports stdio MCP servers today.
+  transport: stdio

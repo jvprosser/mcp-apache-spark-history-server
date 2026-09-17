@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -11,9 +12,17 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from spark_history_mcp.api.emr_persistent_ui_client import EMRPersistentUIClient
 from spark_history_mcp.api.spark_client import SparkRestClient
+from spark_history_mcp.auth.cdp_workload import CDPWorkloadTokenError
 from spark_history_mcp.config.config import Config, load_config
 
 from ..utils.utils import ApplicationDiscovery
+
+# How often the CDP workload token refresh loop wakes up. The provider's own
+# skew (default 120s) decides whether an actual refresh happens; this only
+# bounds latency between "token about to expire" and "we noticed."
+_CDP_REFRESH_INTERVAL_SECONDS = 300
+
+logger = logging.getLogger(__name__)
 
 
 def _emr_cookie_reauth(emr_client: EMRPersistentUIClient) -> str:
@@ -66,9 +75,66 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             default_client = clients[name]
 
     app_discovery = ApplicationDiscovery(clients)
-    yield AppContext(
-        clients=clients, default_client=default_client, app_discovery=app_discovery
+
+    # Start a background refresh loop for any clients using CDP workload
+    # tokens. This is a preemptive belt-and-braces alongside the on-401
+    # refresh in ``_resilient_call`` — keeps hot paths from paying a retry
+    # round-trip when the token is close to expiry.
+    refresh_task = _start_cdp_refresh_task(clients)
+
+    try:
+        yield AppContext(
+            clients=clients,
+            default_client=default_client,
+            app_discovery=app_discovery,
+        )
+    finally:
+        if refresh_task is not None:
+            refresh_task.cancel()
+            try:
+                await refresh_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                # Nothing above cares whether the loop shut down cleanly.
+                pass
+
+
+def _start_cdp_refresh_task(
+    clients: dict[str, SparkRestClient],
+) -> Optional[asyncio.Task]:
+    """Kick off a background refresher for every CDP-workload-authed client.
+
+    Returns ``None`` when nothing needs refreshing so we don't spin an
+    idle task on non-Cloudera deployments.
+    """
+    watched = [c for c in clients.values() if c.token_provider is not None]
+    if not watched:
+        return None
+    return asyncio.create_task(
+        _cdp_refresh_loop(watched), name="cdp-workload-token-refresh"
     )
+
+
+async def _cdp_refresh_loop(clients: list[SparkRestClient]) -> None:
+    while True:
+        try:
+            await asyncio.sleep(_CDP_REFRESH_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        for client in clients:
+            provider = client.token_provider
+            if provider is None:
+                continue
+            try:
+                # ``get_token`` is a no-op when still within the validity
+                # window; only reissues near expiry.
+                token = await asyncio.to_thread(provider.get_token)
+                client._apply_bearer(token)  # noqa: SLF001 (owner writes)
+            except CDPWorkloadTokenError as exc:
+                logger.warning(
+                    "CDP workload token refresh failed for workload=%s: %s",
+                    provider.workload_name,
+                    exc,
+                )
 
 
 def run(config: Config):
