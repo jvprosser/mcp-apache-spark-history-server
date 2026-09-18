@@ -23,7 +23,12 @@ JWTs via :class:`CDPWorkloadTokenProvider`.
 
 import functools
 import inspect
+import logging
+import os
+import shutil
 from typing import Callable, List, Optional
+
+logger = logging.getLogger(__name__)
 
 from spark_history_mcp.api_client.api.default_api import DefaultApi
 from spark_history_mcp.api_client.api_client import ApiClient
@@ -187,15 +192,40 @@ class SparkRestClient:
                         "auth.type=cdp_workload requires auth.workload_name "
                         "(e.g. 'DE')."
                     )
+                # Startup diagnostics: knowing whether the ``cdp`` binary is
+                # visible (and where) turns the "TaskGroup swallowed the
+                # exception" failure mode into a one-line log answer.
+                cdp_path = shutil.which("cdp")
+                env_token_present = bool(os.environ.get("CDP_WORKLOAD_TOKEN"))
+                logger.info(
+                    "CDP workload auth: workload_name=%s cdp_cli=%s "
+                    "CDP_WORKLOAD_TOKEN_env=%s host=%s ca=%s",
+                    auth.workload_name,
+                    cdp_path or "<NOT FOUND on $PATH>",
+                    env_token_present,
+                    configuration.host,
+                    configuration.ssl_ca_cert,
+                )
                 self._token_provider = CDPWorkloadTokenProvider(
                     workload_name=auth.workload_name,
                     refresh_skew_seconds=auth.workload_refresh_skew_seconds,
                 )
                 # Prime the header — subsequent refreshes reuse
-                # ``_apply_bearer`` on ``self._api.api_client``.
-                self._apply_bearer_to(
-                    api_client, self._token_provider.get_token()
-                )
+                # ``_apply_bearer`` on ``self._api.api_client``. Log the
+                # failure explicitly so the TaskGroup wrapper in FastMCP
+                # can't hide it.
+                try:
+                    initial_token = self._token_provider.get_token()
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(
+                        "Initial CDP workload token fetch failed for "
+                        "workload_name=%s: %s",
+                        auth.workload_name,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
+                self._apply_bearer_to(api_client, initial_token)
 
         return DefaultApi(api_client)
 

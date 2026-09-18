@@ -40,12 +40,36 @@ class AppContext:
 
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
+    try:
+        async with _app_lifespan_impl(server) as ctx:
+            yield ctx
+    except BaseException as exc:  # noqa: BLE001
+        # FastMCP runs lifespan inside a TaskGroup; unhandled exceptions
+        # surface as "unhandled errors in a TaskGroup (1 sub-exception)"
+        # with no traceback. Log the real cause here.
+        logger.error("Spark HS MCP startup failed: %s", exc, exc_info=True)
+        raise
+
+
+@asynccontextmanager
+async def _app_lifespan_impl(server: FastMCP) -> AsyncIterator[AppContext]:
     config = load_config()
+    logger.info(
+        "Loaded config: servers=%s default_transport=%s",
+        list(config.servers.keys()),
+        config.mcp.transport,
+    )
 
     clients: dict[str, SparkRestClient] = {}
     default_client = None
 
     for name, server_config in config.servers.items():
+        logger.info(
+            "Initialising Spark client name=%s url=%s auth_type=%s",
+            name,
+            server_config.url,
+            getattr(server_config.auth, "type", None) if server_config.auth else None,
+        )
         # Check if this is an EMR server configuration
         if server_config.emr_cluster_arn:
             # Create EMR client
