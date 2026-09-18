@@ -38,7 +38,10 @@ from spark_history_mcp.api_client.exceptions import (
     NotFoundException,
     UnauthorizedException,
 )
-from spark_history_mcp.auth.cdp_workload import CDPWorkloadTokenProvider
+from spark_history_mcp.auth.cdp_workload import (
+    CDPWorkloadTokenProvider,
+    _probe_cdp_context,
+)
 from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.environment import Environment
 from spark_history_mcp.api_client.models.executor import Executor
@@ -196,15 +199,14 @@ class SparkRestClient:
                 # visible (and where) turns the "TaskGroup swallowed the
                 # exception" failure mode into a one-line log answer.
                 cdp_path = shutil.which("cdp")
-                env_token_present = bool(os.environ.get("CDP_WORKLOAD_TOKEN"))
                 logger.info(
                     "CDP workload auth: workload_name=%s cdp_cli=%s "
-                    "CDP_WORKLOAD_TOKEN_env=%s host=%s ca=%s",
+                    "host=%s ca=%s. %s",
                     auth.workload_name,
                     cdp_path or "<NOT FOUND on $PATH>",
-                    env_token_present,
                     configuration.host,
                     configuration.ssl_ca_cert,
+                    _probe_cdp_context(),
                 )
                 self._token_provider = CDPWorkloadTokenProvider(
                     workload_name=auth.workload_name,

@@ -28,7 +28,11 @@ dependencies = [
     "pydantic-settings~=2.13",
     "requests[socks]>=2.32.3,<3.0",
     "pysocks~=1.7",
-    "mcp-proxy-for-aws>=1.0,<2.0"
+    "mcp-proxy-for-aws>=1.0,<2.0",
+    # In-process CDP Control Plane client — used by the cdp_workload auth
+    # provider as a fallback when the ``cdp`` CLI binary isn't in the
+    # container's PATH (e.g. Cloudera AI Agent Studio's runtime image).
+    "cdpcli>=0.9,<1.0"
 ]
 
 [build-system]
