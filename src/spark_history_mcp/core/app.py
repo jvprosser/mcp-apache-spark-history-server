@@ -152,13 +152,15 @@ def _log_startup_probe(name: str, client: SparkRestClient) -> None:
     """
     result = client.probe()
     if result["error"]:
+        hint = _probe_error_hint(result["error"])
         logger.error(
-            "Startup probe %s: GET %s failed after %dms -- %s (auth=%s)",
+            "Startup probe %s: GET %s failed after %dms -- %s (auth=%s)%s",
             name,
             result["url"],
             result["elapsed_ms"],
             result["error"],
             client.auth_summary(),
+            f". {hint}" if hint else "",
         )
         return
 
@@ -189,6 +191,28 @@ def _log_startup_probe(name: str, client: SparkRestClient) -> None:
         client.auth_summary(),
         _probe_hint(status, challenge),
     )
+
+
+def _probe_error_hint(error: str) -> str:
+    """Turn a probe transport failure into an actionable sentence.
+
+    Only covers failures whose cause is *not* recoverable from the exception
+    text. A refused connection or a DNS miss already says what is wrong;
+    padding those adds noise, so they return "" and the raw error stands.
+    """
+    if "LIBRARY_HAS_NO_CIPHERS" in error:
+        return (
+            "The TLS handshake offered no ciphers at all, which points at the "
+            "interpreter's OpenSSL rather than this server: uv-managed CPython "
+            "bundles its own OpenSSL but still reads the host "
+            "/etc/ssl/openssl.cnf, and a RHEL-family crypto policy (CDSW/CML "
+            "included) can leave it with an empty cipher list. Retry with "
+            "OPENSSL_CONF=/dev/null, or use the system interpreter "
+            "(uvx --python /usr/bin/python3 ...). If curl reaches this same "
+            "URL, that confirms it -- verify_ssl/ssl_ca_cert will not help, "
+            "since this fails before any certificate is checked."
+        )
+    return ""
 
 
 def _probe_hint(status: int, challenge: Optional[str]) -> str:

@@ -12,7 +12,7 @@ from spark_history_mcp.api_client.models.application_attempt import ApplicationA
 from spark_history_mcp.api_client.models.executor import Executor
 from spark_history_mcp.api_client.models.job import Job
 from spark_history_mcp.config.config import AuthConfig, ServerConfig
-from spark_history_mcp.core.app import _probe_hint
+from spark_history_mcp.core.app import _probe_error_hint, _probe_hint
 
 
 def _make_jobs(count):
@@ -113,6 +113,36 @@ class TestProbeHint(unittest.TestCase):
         # Knox answers with uppercase "BASIC"; Spark/others use "Basic".
         for challenge in ('BASIC realm="application"', "Basic realm=x"):
             self.assertIn("accepts Basic auth", _probe_hint(401, challenge))
+
+
+class TestProbeErrorHint(unittest.TestCase):
+    """Transport failures whose cause is not visible in the exception text."""
+
+    # Verbatim from a CDSW session against a CDP DataHub SHS on 18489.
+    NO_CIPHERS = (
+        "MaxRetryError: HTTPSConnectionPool(host='master0.example.site', "
+        "port=18489): Max retries exceeded with url: /api/v1/version "
+        "(Caused by SSLError(SSLError(161, '[SSL: LIBRARY_HAS_NO_CIPHERS] "
+        "library has no ciphers (_ssl.c:3036)')))"
+    )
+
+    def test_no_ciphers_names_the_interpreter_and_the_workaround(self):
+        hint = _probe_error_hint(self.NO_CIPHERS)
+        self.assertIn("OPENSSL_CONF", hint)
+        self.assertIn("openssl.cnf", hint)
+
+    def test_no_ciphers_rules_out_the_tls_verification_settings(self):
+        # The instinct is to reach for verify_ssl; the handshake dies before
+        # certificates are looked at, so the hint must say so explicitly.
+        self.assertIn("verify_ssl", _probe_error_hint(self.NO_CIPHERS))
+
+    def test_self_explanatory_errors_get_no_hint(self):
+        for error in (
+            "ConnectionRefusedError: [Errno 111] Connection refused",
+            "NewConnectionError: Failed to resolve 'nope.invalid'",
+            "ReadTimeoutError: Read timed out. (read timeout=30)",
+        ):
+            self.assertEqual(_probe_error_hint(error), "")
 
 
 class TestSparkRestClient(unittest.TestCase):
