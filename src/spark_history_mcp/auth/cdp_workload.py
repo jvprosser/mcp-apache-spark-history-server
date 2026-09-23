@@ -53,8 +53,11 @@ _ENV_FALLBACK_ALIASES = (
     "WORKLOAD_AUTH_TOKEN",
 )
 # Filesystem locations Cloudera runtimes have mounted the workload JWT to.
+# S108 warns about hardcoded /tmp paths, but these are only ever *read*: the
+# CML/CAI runtime chooses where it drops the token, so there is nothing to
+# harden here. Writing to /tmp would be a different matter.
 _TOKEN_FILE_CANDIDATES = (
-    "/tmp/jwt",
+    "/tmp/jwt",  # noqa: S108
     "/etc/machine-user-credentials/workload_token",
 )
 _CLI_NAME = "cdp"
@@ -64,7 +67,7 @@ class CDPWorkloadTokenError(RuntimeError):
     """Raised when a workload token cannot be produced or parsed."""
 
 
-class _CDPCLINotAvailable(Exception):
+class _CDPCLINotAvailableError(Exception):
     """Signal the ``cdpcli`` library path can't produce a token; try CLI."""
 
 
@@ -82,7 +85,7 @@ _CDP_CRED_ENV_VARS = (
 _CDP_CRED_FILE_PATHS = (
     os.path.expanduser("~/.cdp/credentials"),
     os.path.expanduser("~/.cdp/config"),
-    "/tmp/jwt",  # CML/CAI sometimes drops the workload token here
+    "/tmp/jwt",  # noqa: S108 -- CML/CAI sometimes drops the workload token here
     "/etc/machine-user-credentials/workload_token",
 )
 
@@ -93,6 +96,7 @@ def _probe_cdp_context() -> str:
     present_files = [p for p in _CDP_CRED_FILE_PATHS if os.path.exists(p)]
     try:
         import cdpcli  # type: ignore  # noqa: F401
+
         cdpcli_installed = True
     except ImportError:
         cdpcli_installed = False
@@ -203,7 +207,7 @@ class CDPWorkloadTokenProvider:
         # runtime image). Same underlying REST call, no subprocess.
         try:
             return self._fetch_via_cdpcli()
-        except _CDPCLINotAvailable:
+        except _CDPCLINotAvailableError:
             pass  # library not installed; fall through to CLI subprocess.
 
         if not self._cli_path:
@@ -216,7 +220,13 @@ class CDPWorkloadTokenProvider:
             )
 
         try:
-            completed = subprocess.run(
+            # noqa S603: shelling out to `cdp` is this fallback's whole purpose
+            # (source 4 in the module docstring). The argv is fixed literals
+            # plus _cli_path (from shutil.which, so a PATH entry rather than a
+            # caller-supplied string) and _workload_name (config: DE/DF/OPDB).
+            # No shell=True, so argv is passed to execve untouched and shell
+            # metacharacters in workload_name cannot start a second command.
+            completed = subprocess.run(  # noqa: S603
                 [
                     self._cli_path,
                     "iam",
@@ -245,7 +255,7 @@ class CDPWorkloadTokenProvider:
         """Call ``iam.generate_workload_auth_token`` via the cdpcli Python API.
 
         Same REST endpoint the CLI hits; avoids the subprocess dependency.
-        Raises :class:`_CDPCLINotAvailable` when the package isn't installed
+        Raises :class:`_CDPCLINotAvailableError` when the package isn't installed
         or credentials can't be resolved, so the caller can fall back.
         """
         try:
@@ -257,7 +267,7 @@ class CDPWorkloadTokenProvider:
             from cdpcli.loader import Loader  # type: ignore
             from cdpcli.parser import ResponseParserFactory  # type: ignore
         except ImportError as exc:
-            raise _CDPCLINotAvailable(f"cdpcli not importable: {exc}") from exc
+            raise _CDPCLINotAvailableError(f"cdpcli not importable: {exc}") from exc
 
         try:
             loader = Loader()
@@ -280,28 +290,20 @@ class CDPWorkloadTokenProvider:
                 tls_verification=True,
                 credentials=credentials,
             )
-            payload = iam.generate_workload_auth_token(
-                workloadName=self._workload_name
-            )
+            payload = iam.generate_workload_auth_token(workloadName=self._workload_name)
         except Exception as exc:  # noqa: BLE001
             # Any error here (missing creds, network, service error) — treat
             # as "cdpcli path unusable" so we can fall through to the CLI.
-            raise _CDPCLINotAvailable(
+            raise _CDPCLINotAvailableError(
                 f"cdpcli generate_workload_auth_token failed: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
         token = payload.get("token") if isinstance(payload, dict) else None
-        expire_at = (
-            payload.get("expireAt") if isinstance(payload, dict) else None
-        )
-        endpoint_url = (
-            payload.get("endpointUrl") if isinstance(payload, dict) else None
-        )
+        expire_at = payload.get("expireAt") if isinstance(payload, dict) else None
+        endpoint_url = payload.get("endpointUrl") if isinstance(payload, dict) else None
         if not token:
-            raise _CDPCLINotAvailable(
-                f"cdpcli returned no token: {payload!r}"
-            )
+            raise _CDPCLINotAvailableError(f"cdpcli returned no token: {payload!r}")
         logger.info(
             "Obtained CDP workload JWT via cdpcli library "
             "(workload_name=%s, endpointUrl=%s, expires %s)",
@@ -328,8 +330,7 @@ class CDPWorkloadTokenProvider:
                 f"cdp CLI response missing 'token' field: {payload!r}"
             )
         logger.info(
-            "Obtained CDP workload JWT via cdp CLI "
-            "(workload_name=%s, expires %s)",
+            "Obtained CDP workload JWT via cdp CLI (workload_name=%s, expires %s)",
             self._workload_name,
             expire_at or "unknown",
         )

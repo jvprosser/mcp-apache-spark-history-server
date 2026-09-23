@@ -19,17 +19,17 @@ class TestSparkRestClientCDPWorkload(unittest.TestCase):
     def test_initial_bearer_header_from_provider(self) -> None:
         with patch(
             "spark_history_mcp.api.spark_client.CDPWorkloadTokenProvider"
-        ) as ProviderCls:
+        ) as provider_cls:
             provider = MagicMock()
             provider.get_token.return_value = "jwt-1"
-            ProviderCls.return_value = provider
+            provider_cls.return_value = provider
 
             client = SparkRestClient(_server_config())
 
         header = client._api.api_client.default_headers.get("Authorization")
         self.assertEqual(header, "Bearer jwt-1")
         self.assertIs(client.token_provider, provider)
-        ProviderCls.assert_called_once_with(
+        provider_cls.assert_called_once_with(
             workload_name="DE",
             refresh_skew_seconds=120,
         )
@@ -37,11 +37,11 @@ class TestSparkRestClientCDPWorkload(unittest.TestCase):
     def test_401_triggers_force_refresh_and_retry(self) -> None:
         with patch(
             "spark_history_mcp.api.spark_client.CDPWorkloadTokenProvider"
-        ) as ProviderCls:
+        ) as provider_cls:
             provider = MagicMock()
             provider.get_token.return_value = "jwt-1"
             provider.force_refresh.return_value = "jwt-2"
-            ProviderCls.return_value = provider
+            provider_cls.return_value = provider
 
             client = SparkRestClient(_server_config())
 

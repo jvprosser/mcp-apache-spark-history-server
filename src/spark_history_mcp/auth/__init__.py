@@ -9,6 +9,6 @@ Currently just :mod:`cdp_workload`, for Cloudera CDP workload JWTs.
 """
 
 from spark_history_mcp.auth.cdp_workload import (  # noqa: F401
-    CDPWorkloadTokenProvider,
     CDPWorkloadTokenError,
+    CDPWorkloadTokenProvider,
 )

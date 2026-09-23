@@ -3,7 +3,6 @@
 import json
 import os
 import subprocess
-import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -14,8 +13,12 @@ from spark_history_mcp.auth.cdp_workload import (
 )
 
 
-def _cli_stdout(token: str = "jwt-abc", ttl_seconds: int = 600) -> str:
-    """Fake CDP CLI JSON output with an ISO expiry ``ttl_seconds`` from now."""
+def _cli_stdout(token: str = "jwt-abc", ttl_seconds: int = 600) -> str:  # noqa: S107
+    """Fake CDP CLI JSON output with an ISO expiry ``ttl_seconds`` from now.
+
+    noqa S107: "jwt-abc" is a placeholder stood up to be asserted against, not
+    a credential -- the real token never leaves the CDP control plane.
+    """
     expire = datetime.now(tz=timezone.utc) + timedelta(seconds=ttl_seconds)
     return json.dumps(
         {
@@ -101,7 +104,9 @@ class TestCDPWorkloadTokenProvider(unittest.TestCase):
             self.assertEqual(provider.force_refresh(), "t2")
 
     def test_env_fallback_when_cli_missing(self) -> None:
-        os.environ["CDP_WORKLOAD_TOKEN"] = "static-jwt"
+        # noqa S105: the env var *name* is what matters here -- this asserts
+        # the provider reads CDP_WORKLOAD_TOKEN, and "static-jwt" is a marker.
+        os.environ["CDP_WORKLOAD_TOKEN"] = "static-jwt"  # noqa: S105
         # No cli_path and shutil.which returns None → env fallback wins.
         with patch(
             "spark_history_mcp.auth.cdp_workload.shutil.which", return_value=None

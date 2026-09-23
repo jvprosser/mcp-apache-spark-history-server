@@ -24,12 +24,9 @@ JWTs via :class:`CDPWorkloadTokenProvider`.
 import functools
 import inspect
 import logging
-import os
 import shutil
 import time
 from typing import Callable, List, Optional
-
-logger = logging.getLogger(__name__)
 
 from spark_history_mcp.api_client.api.default_api import DefaultApi
 from spark_history_mcp.api_client.api_client import ApiClient
@@ -38,10 +35,6 @@ from spark_history_mcp.api_client.exceptions import (
     ForbiddenException,
     NotFoundException,
     UnauthorizedException,
-)
-from spark_history_mcp.auth.cdp_workload import (
-    CDPWorkloadTokenProvider,
-    _probe_cdp_context,
 )
 from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.environment import Environment
@@ -52,7 +45,13 @@ from spark_history_mcp.api_client.models.stage_data import StageData
 from spark_history_mcp.api_client.models.task import Task
 from spark_history_mcp.api_client.models.task_metrics_summary import TaskMetricsSummary
 from spark_history_mcp.api_client.models.thread_stack_trace import ThreadStackTrace
+from spark_history_mcp.auth.cdp_workload import (
+    CDPWorkloadTokenProvider,
+    _probe_cdp_context,
+)
 from spark_history_mcp.config.config import ServerConfig
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_QUANTILES = "0.05, 0.25, 0.5, 0.75, 0.95"
 _PROXY_URL = "socks5h://localhost:8157"
@@ -188,9 +187,7 @@ class SparkRestClient:
                 if token:
                     api_client.set_default_header("Authorization", token)
             elif flow == "bearer" and auth.token:
-                api_client.set_default_header(
-                    "Authorization", f"Bearer {auth.token}"
-                )
+                api_client.set_default_header("Authorization", f"Bearer {auth.token}")
             elif flow == "cdp_workload":
                 if not auth.workload_name:
                     raise ValueError(
@@ -202,8 +199,7 @@ class SparkRestClient:
                 # exception" failure mode into a one-line log answer.
                 cdp_path = shutil.which("cdp")
                 logger.info(
-                    "CDP workload auth: workload_name=%s cdp_cli=%s "
-                    "host=%s ca=%s. %s",
+                    "CDP workload auth: workload_name=%s cdp_cli=%s host=%s ca=%s. %s",
                     auth.workload_name,
                     cdp_path or "<NOT FOUND on $PATH>",
                     configuration.host,
