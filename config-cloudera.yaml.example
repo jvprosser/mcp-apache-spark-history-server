@@ -4,33 +4,80 @@
 # so that no secrets or environment-specific paths are committed. This
 # file exists to show the equivalent YAML shape.
 #
-# The DataHub Spark History Server is reached through the Knox gateway.
+# The DataHub Spark History Server is reached through the Knox *gateway*
+# host, never the master node's direct SHS port (18088/18089) -- master
+# nodes carry private IPs and their direct ports expect Kerberos SPNEGO
+# rather than the bearer token this client sends.
+#
 # Get the URL from CDP Console -> Data Hub -> <cluster> -> Endpoints ->
-# "Spark History Server". It typically looks like
-#   https://<gateway-host>/<env-name>/cdp-proxy/sparkhistoryserver
-# (some environments append the cluster name to the last segment).
+# "Spark History Server". The path segment after the host is the *Data Hub
+# cluster* name, not the environment name. The topology differs by Spark
+# major version:
+#   Spark 3: https://<gateway-host>/<datahub-name>/cdp-proxy-api/spark3history
+#   Spark 2: https://<gateway-host>/<datahub-name>/cdp-proxy/sparkhistoryserver
+# Guessing wrong returns 404. A correct path returns 401 until you add
+# credentials -- that 401/404 distinction is the cheapest way to confirm it.
 
 servers:
   datahub:
     default: true
-    url: "https://<gateway-host>/<env-name>/cdp-proxy/sparkhistoryserver"
+    url: "https://<gateway-host>/<datahub-name>/cdp-proxy-api/spark3history"
 
-    # Knox presents a cert signed by an internal CA. Point at a PEM bundle
-    # that contains it. Inside a CML runtime, the workspace-wide bundle
-    # usually sits at /etc/ssl/certs/ca-certificates.crt.
+    # Public CDP gateways now present publicly-trusted certs (Let's Encrypt),
+    # so verify_ssl alone is usually enough and ssl_ca_cert can be omitted.
+    # Check with:
+    #   curl -s -o /dev/null -w '%{ssl_verify_result}\n' <your-url>/api/v1/version
+    # A "0" means the system trust store suffices -- leave ssl_ca_cert unset.
+    # Only set it for private-network deployments fronted by an internal CA,
+    # and beware: pointing it at a path absent in the runtime fails silently.
     verify_ssl: true
-    ssl_ca_cert: "/etc/ssl/certs/ca-certificates.crt"
+    # ssl_ca_cert: "/etc/ssl/certs/ca-certificates.crt"
 
     timeout: 60
 
+    # TCP connect + TLS handshake budget, separate from the read `timeout`
+    # above. Keeps an unreachable host (e.g. a private-IP master node whose
+    # firewall drops SYNs) failing in seconds instead of eating the full read
+    # budget. Note urllib3 retries a connection 3x, so worst case is ~3x this.
+    connect_timeout: 5
+
+    # Issue `GET <url>/api/v1/version` at startup and log the result. Off by
+    # default so startup never depends on the SHS being up. Turn it on to
+    # diagnose endpoint/auth problems, which otherwise stay invisible until
+    # the first tool call. The log line distinguishes the failure modes:
+    #   -> 200               reachable and authenticated
+    #   -> 404               base URL path is wrong (check the Knox topology)
+    #   -> 401 + Basic       path correct, credentials wrong or missing
+    #   -> 401 + Negotiate   Kerberos SPNEGO, which this client cannot do
+    # Credentials are never logged -- only `basic(username=...)`.
+    probe_on_startup: true
+
     auth:
-      type: cdp_workload
-      # CDP workload service name — confirm with
-      #   cdp iam list-workload-clients
-      # In most DataHub environments this is "DE".
-      workload_name: "DE"
-      # Refresh the JWT this many seconds before it expires.
-      workload_refresh_skew_seconds: 120
+      # DataHub Knox authenticates with the CDP *workload* username and
+      # password -- Knox answers an unauthenticated request with
+      #   WWW-Authenticate: BASIC realm="application"
+      # Set the password in CDP Console -> Management Console -> User
+      # Management -> <user> -> Set Workload Password (distinct from SSO).
+      # Read the username from: cdp iam get-user --query 'user.workloadUsername'
+      type: basic
+      username: "<workload-username>"
+      password: "<workload-password>"      # prefer SHS_SERVERS__<name>__AUTH__PASSWORD
+
+      # NOT for DataHub: type: cdp_workload
+      #
+      # `cdp iam generate-workload-auth-token --workload-name DE` issues a
+      # token for the Cloudera *Data Engineering* service, with an audience of
+      # https://de.<env>.cloudera.site. A DataHub Knox gateway rejects it with
+      # 401 -- verified 2026-09-23 against a go01-obser-de DataHub, where the
+      # minted token's aud pointed at an unrelated CDP environment.
+      #
+      # Use cdp_workload only for genuine workload APIs (CDE, DF, OPDB), where
+      # the audience matches the service you are calling. Valid workload names
+      # are DE, DF, OPDB -- listed by:
+      #   cdp iam generate-workload-auth-token help
+      # (there is no "cdp iam list-workload-clients" subcommand.)
+      #
+      # workload_refresh_skew_seconds: 120   # JWT refresh lead time
 
 mcp:
   # Agent Studio only supports stdio MCP servers today.

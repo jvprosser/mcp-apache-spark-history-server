@@ -11,7 +11,8 @@ from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.application_attempt import ApplicationAttempt
 from spark_history_mcp.api_client.models.executor import Executor
 from spark_history_mcp.api_client.models.job import Job
-from spark_history_mcp.config.config import ServerConfig
+from spark_history_mcp.config.config import AuthConfig, ServerConfig
+from spark_history_mcp.core.app import _probe_hint
 
 
 def _make_jobs(count):
@@ -31,6 +32,89 @@ class TestAppPath(unittest.TestCase):
         self.assertEqual(SparkRestClient._app_path("app-1", "2"), "app-1/2")
 
 
+class TestProbe(unittest.TestCase):
+    """The startup probe reports status/challenge and never raises or leaks."""
+
+    def _client(self, **auth_kwargs):
+        config = ServerConfig(
+            url="http://spark-history-server:18080",
+            auth=AuthConfig(**auth_kwargs) if auth_kwargs else AuthConfig(),
+        )
+        client = SparkRestClient(config)
+        client._api = MagicMock()
+        return client
+
+    def _probe_with_response(self, client, status, challenge=None):
+        response = MagicMock()
+        response.status = status
+        response.getheader.return_value = challenge
+        client._api.api_client.rest_client.request.return_value = response
+        return client.probe()
+
+    def test_probe_success(self):
+        result = self._probe_with_response(self._client(), 200)
+        self.assertEqual(result["status"], 200)
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["url"].endswith("/api/v1/version"))
+
+    def test_probe_reports_challenge_scheme(self):
+        result = self._probe_with_response(
+            self._client(), 401, 'BASIC realm="application"'
+        )
+        self.assertEqual(result["status"], 401)
+        self.assertEqual(result["www_authenticate"], 'BASIC realm="application"')
+
+    def test_probe_swallows_connection_error(self):
+        # Startup must survive an unreachable server; the probe reports
+        # rather than propagating, so the MCP server still comes up.
+        client = self._client()
+        client._api.api_client.rest_client.request.side_effect = OSError("refused")
+        result = client.probe()
+        self.assertIsNone(result["status"])
+        self.assertIn("OSError", result["error"])
+
+    def test_probe_uses_connect_and_read_timeout(self):
+        client = self._client()
+        self._probe_with_response(client, 200)
+        _, kwargs = client._api.api_client.rest_client.request.call_args
+        self.assertEqual(
+            kwargs["_request_timeout"], (client.connect_timeout, client.timeout)
+        )
+
+    def test_auth_summary_never_reveals_secrets(self):
+        # noqa S106: these fake credentials exist precisely so the assertions
+        # below can prove they never reach the log output.
+        basic = self._client(type="basic", username="alice", password="s3cr3t")  # noqa: S106
+        self.assertEqual(basic.auth_summary(), "basic(username=alice)")
+        self.assertNotIn("s3cr3t", basic.auth_summary())
+
+        bearer = self._client(type="bearer", token="header.payload.signature")  # noqa: S106
+        self.assertNotIn("payload", bearer.auth_summary())
+        self.assertIn("token_len=", bearer.auth_summary())
+
+        workload = self._client(type="cdp_workload", workload_name="DE")
+        self.assertEqual(workload.auth_summary(), "cdp_workload(workload_name=DE)")
+
+        self.assertEqual(self._client().auth_summary(), "none")
+
+
+class TestProbeHint(unittest.TestCase):
+    """The hint turns a status/challenge pair into the right diagnosis."""
+
+    def test_404_blames_the_url_not_auth(self):
+        hint = _probe_hint(404, None)
+        self.assertIn("base URL path is wrong", hint)
+
+    def test_negotiate_names_the_spnego_limitation(self):
+        hint = _probe_hint(401, "Negotiate")
+        self.assertIn("SPNEGO", hint)
+
+    def test_basic_challenge_is_case_insensitive(self):
+        # Knox answers with uppercase "BASIC"; Spark/others use "Basic".
+        for challenge in ('BASIC realm="application"', "Basic realm=x"):
+            self.assertIn("accepts Basic auth", _probe_hint(401, challenge))
+
+
 class TestSparkRestClient(unittest.TestCase):
     """All calls go through the generated DefaultApi (single transport)."""
 
@@ -39,7 +123,9 @@ class TestSparkRestClient(unittest.TestCase):
         self.client = SparkRestClient(self.server_config)
         self.mock_api = MagicMock()
         self.client._api = self.mock_api
-        self.timeout = self.client.timeout
+        # Requests carry a (connect, read) pair so an unreachable host fails
+        # after connect_timeout rather than consuming the whole read budget.
+        self.timeout = (self.client.connect_timeout, self.client.timeout)
 
     def test_base_url(self):
         self.assertEqual(

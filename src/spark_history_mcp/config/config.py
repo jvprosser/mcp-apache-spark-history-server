@@ -153,7 +153,17 @@ class ServerConfig(BaseSettings):
     ssl_ca_cert: Optional[str] = None
     emr_cluster_arn: Optional[str] = None  # EMR specific field
     use_proxy: bool = False
-    timeout: int = 30  # HTTP request timeout in seconds
+    timeout: int = 30  # HTTP read timeout in seconds
+    # TCP connect + TLS handshake budget, kept separate from ``timeout`` so an
+    # unreachable host fails in seconds instead of consuming the whole read
+    # budget. Matters most for private-IP hosts whose firewalls drop SYNs
+    # silently rather than sending RST.
+    connect_timeout: int = 5
+    # Issue ``GET <url>/api/v1/version`` during startup and log the outcome.
+    # Off by default: startup must not depend on the SHS being reachable.
+    # Turn on to diagnose endpoint/auth problems, which otherwise stay
+    # invisible until the first tool call.
+    probe_on_startup: bool = False
     include_plan_description: Optional[bool] = None
     # Ignore unknown keys for compatibility with the shared shs CLI config.
     model_config = SettingsConfigDict(extra="ignore")

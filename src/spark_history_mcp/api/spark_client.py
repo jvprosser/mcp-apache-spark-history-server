@@ -26,6 +26,7 @@ import inspect
 import logging
 import os
 import shutil
+import time
 from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ class SparkRestClient:
         self.verify_ssl = self.config.verify_ssl
         self.ssl_ca_cert = self.config.ssl_ca_cert
         self.timeout = self.config.timeout
+        self.connect_timeout = self.config.connect_timeout
 
         # Optional callback returning a fresh Cookie header (EMR re-auth).
         self._reauth: Optional[Callable[[], str]] = None
@@ -259,8 +261,81 @@ class SparkRestClient:
         self._api.api_client.cookie = cookie_header
 
     def _invoke(self, fn, *args, **kwargs):
-        """Call a generated API method applying the configured request timeout."""
-        return fn(*args, _request_timeout=self.timeout, **kwargs)
+        """Call a generated API method applying the configured request timeout.
+
+        The ``(connect, read)`` tuple is passed through to
+        :class:`urllib3.Timeout` by the generated REST layer, so a host that
+        drops connections fails after ``connect_timeout`` instead of stalling
+        for the full read budget.
+        """
+        return fn(
+            *args, _request_timeout=(self.connect_timeout, self.timeout), **kwargs
+        )
+
+    # ------------------------------------------------------------------
+    # Diagnostics
+    # ------------------------------------------------------------------
+    def probe(self) -> dict:
+        """Issue ``GET <base_url>/version`` and describe the outcome.
+
+        Deliberately bypasses the generated ``DefaultApi`` wrapper and calls
+        the REST layer directly: the wrapper raises on non-2xx, but the
+        diagnostic value is in the *status* and the ``WWW-Authenticate``
+        header. A 404 means the base URL path is wrong, a 401 means the path
+        is right and only credentials are missing, and the challenge scheme
+        in ``WWW-Authenticate`` says which auth flow the server will accept
+        (``Basic`` is supported here; ``Negotiate``/SPNEGO is not).
+
+        Never raises, and never logs credentials. Returns a dict with
+        ``status``, ``elapsed_ms``, ``www_authenticate`` and ``error``.
+
+        Note that urllib3 retries a failed connection three times, so against
+        a host that silently drops packets this can take roughly
+        ``3 * connect_timeout`` before reporting. That is why the probe is
+        opt-in rather than always-on.
+        """
+        api_client = self._api.api_client
+        url = f"{self.base_url}/version"
+        started = time.monotonic()
+        try:
+            response = api_client.rest_client.request(
+                "GET",
+                url,
+                headers=dict(api_client.default_headers),
+                _request_timeout=(self.connect_timeout, self.timeout),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Connect refused/timed out, TLS failure, DNS failure. The
+            # exception type is the signal, so keep it in the message.
+            return {
+                "url": url,
+                "status": None,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "www_authenticate": None,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        return {
+            "url": url,
+            "status": response.status,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+            "www_authenticate": response.getheader("WWW-Authenticate"),
+            "error": None,
+        }
+
+    def auth_summary(self) -> str:
+        """Describe the configured auth flow without revealing any secret."""
+        auth = self.config.auth
+        if not auth:
+            return "none"
+        flow = auth.type or _infer_auth_type(auth) or "none"
+        if flow == "basic":
+            return f"basic(username={auth.username})"
+        if flow == "cdp_workload":
+            return f"cdp_workload(workload_name={auth.workload_name})"
+        if flow == "bearer":
+            # Length only: enough to tell "set" from "empty string".
+            return f"bearer(token_len={len(auth.token or '')})"
+        return flow
 
     @staticmethod
     def _app_path(app_id: str, app_attempt_id: Optional[str] = None) -> str:

@@ -98,6 +98,9 @@ async def _app_lifespan_impl(server: FastMCP) -> AsyncIterator[AppContext]:
         if server_config.default:
             default_client = clients[name]
 
+        if server_config.probe_on_startup:
+            _log_startup_probe(name, clients[name])
+
     app_discovery = ApplicationDiscovery(clients)
 
     # Start a background refresh loop for any clients using CDP workload
@@ -105,6 +108,24 @@ async def _app_lifespan_impl(server: FastMCP) -> AsyncIterator[AppContext]:
     # refresh in ``_resilient_call`` — keeps hot paths from paying a retry
     # round-trip when the token is close to expiry.
     refresh_task = _start_cdp_refresh_task(clients)
+
+    # A stdio server emits nothing more until a client speaks JSON-RPC on
+    # stdin, which is indistinguishable from a hang when run by hand. Say so
+    # explicitly rather than leaving the last line looking like a stall.
+    transport = os.getenv("SHS_MCP_TRANSPORT") or config.mcp.transport or "unknown"
+    if transport == "stdio":
+        logger.info(
+            "MCP server ready: transport=stdio, waiting for JSON-RPC on stdin. "
+            "No further log output is expected until a client connects -- this "
+            "is not a hang."
+        )
+    else:
+        logger.info(
+            "MCP server ready: transport=%s listening on %s:%s",
+            transport,
+            config.mcp.address,
+            config.mcp.port,
+        )
 
     try:
         yield AppContext(
@@ -120,6 +141,79 @@ async def _app_lifespan_impl(server: FastMCP) -> AsyncIterator[AppContext]:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 # Nothing above cares whether the loop shut down cleanly.
                 pass
+
+
+def _log_startup_probe(name: str, client: SparkRestClient) -> None:
+    """Log the result of a one-shot connectivity/auth probe for one server.
+
+    Log-and-continue by design: a transient SHS outage must not stop the MCP
+    server from starting, since the tools recover on their own once the
+    server is reachable again.
+    """
+    result = client.probe()
+    if result["error"]:
+        logger.error(
+            "Startup probe %s: GET %s failed after %dms -- %s (auth=%s)",
+            name,
+            result["url"],
+            result["elapsed_ms"],
+            result["error"],
+            client.auth_summary(),
+        )
+        return
+
+    status = result["status"]
+    challenge = result["www_authenticate"]
+    if 200 <= status < 300:
+        logger.info(
+            "Startup probe %s: GET %s -> %d in %dms (auth=%s)",
+            name,
+            result["url"],
+            status,
+            result["elapsed_ms"],
+            client.auth_summary(),
+        )
+        return
+
+    # Non-2xx: the status and the challenge scheme are the whole diagnosis.
+    # 404 -> base URL path is wrong. 401 + Basic -> credentials wrong/missing
+    # but the path is right. 401 + Negotiate -> Kerberos SPNEGO, which this
+    # client does not implement.
+    logger.error(
+        "Startup probe %s: GET %s -> %d in %dms, WWW-Authenticate=%s (auth=%s). %s",
+        name,
+        result["url"],
+        status,
+        result["elapsed_ms"],
+        challenge or "<none>",
+        client.auth_summary(),
+        _probe_hint(status, challenge),
+    )
+
+
+def _probe_hint(status: int, challenge: Optional[str]) -> str:
+    """Turn a probe status/challenge pair into an actionable sentence."""
+    scheme = (challenge or "").split(" ", 1)[0].lower()
+    if status == 404:
+        return (
+            "404 means the base URL path is wrong, not that auth failed -- "
+            "check the server.url value (for Cloudera Knox, the Spark 3 "
+            "topology is '<datahub>/cdp-proxy-api/spark3history')."
+        )
+    if status in (401, 403):
+        if scheme == "negotiate":
+            return (
+                "The server wants Kerberos SPNEGO, which this client does not "
+                "implement -- use a gateway that accepts Basic auth instead."
+            )
+        if scheme == "basic":
+            return (
+                "The server accepts Basic auth, so the path is correct and the "
+                "credentials were rejected or missing -- check auth.username "
+                "and auth.password."
+            )
+        return "Credentials were rejected; the base URL path itself is valid."
+    return "Unexpected status; the base URL resolved but did not serve the API."
 
 
 def _start_cdp_refresh_task(
