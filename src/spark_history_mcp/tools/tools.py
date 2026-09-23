@@ -1,5 +1,6 @@
 import heapq
 import logging
+import ssl
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
@@ -11,7 +12,7 @@ from spark_history_mcp.api_client.models.executor import Executor
 from spark_history_mcp.api_client.models.job import Job
 from spark_history_mcp.api_client.models.sql_execution import SQLExecution
 from spark_history_mcp.api_client.models.stage_data import StageData
-from spark_history_mcp.core.app import mcp
+from spark_history_mcp.core.app import _probe_error_hint, mcp
 from spark_history_mcp.models.mcp_types import (
     FailedTask,
     SqlCompareSide,
@@ -326,6 +327,91 @@ def get_client_or_default(
     raise ValueError(
         "No Spark client found. Please specify a valid server name or set a default server."
     )
+
+
+def _probe_diagnosis(probe: dict) -> str:
+    """Turn a raw probe result into a sentence a model can repeat verbatim.
+
+    The fields alone are enough to diagnose the failure, but only if the reader
+    knows that 404 means "wrong path" and 401 means "right path, wrong
+    credentials". Spelling it out keeps an agent from having to infer it --
+    and from guessing wrong.
+    """
+    error = probe["error"]
+    if error:
+        hint = _probe_error_hint(error)
+        base = f"Could not reach the server: {error}"
+        return f"{base} {hint}" if hint else base
+
+    status = probe["status"]
+    if status == 200:
+        return "Reachable and authorized."
+    if status in (401, 403):
+        challenge = probe["www_authenticate"] or "none"
+        return (
+            f"Reached the server, but it rejected the credentials (HTTP {status}). "
+            f"WWW-Authenticate challenge: {challenge}. A 'Negotiate' challenge "
+            f"means the endpoint wants Kerberos/SPNEGO, which this client does "
+            f"not implement -- use the Knox gateway URL instead of the master "
+            f"node, or switch auth.type to cdp_workload."
+        )
+    if status == 404:
+        return (
+            f"Reached the host, but there is no Spark History Server API at this "
+            f"path (HTTP {status}). The base URL is wrong."
+        )
+    return f"Reached the server but got an unexpected HTTP {status}."
+
+
+@mcp.tool()
+def check_spark_connection() -> dict:
+    """Check whether this MCP server can actually reach the Spark History Server.
+
+    Call this FIRST whenever another tool returns no data, reports an error, or
+    you are asked whether the Spark History Server is reachable. Report its
+    output as-is; do not infer application data from it.
+
+    For each configured server this issues a live ``GET /version`` and returns
+    the HTTP status, round-trip latency, any authentication challenge, and the
+    exact transport error when the request could not be made at all. Credentials
+    are never included in the result.
+    """
+    ctx = mcp.get_context()
+    clients = ctx.request_context.lifespan_context.clients
+
+    servers = []
+    for name, client in clients.items():
+        probe = client.probe()
+        servers.append(
+            {
+                "server": name,
+                "url": probe["url"],
+                "auth": client.auth_summary(),
+                "connected": probe["error"] is None,
+                "authorized": probe["status"] == 200,
+                "http_status": probe["status"],
+                "elapsed_ms": probe["elapsed_ms"],
+                "www_authenticate": probe["www_authenticate"],
+                "error": probe["error"],
+                "diagnosis": _probe_diagnosis(probe),
+            }
+        )
+
+    # An empty cipher list fails every HTTPS request with
+    # LIBRARY_HAS_NO_CIPHERS, and is the known failure mode for uv-managed
+    # interpreters on RHEL-family hosts whose crypto policy empties it. Worth
+    # reporting unconditionally: it is one line and it explains an entire
+    # class of "nothing works" that looks nothing like a config error.
+    try:
+        cipher_count = len(ssl.create_default_context().get_ciphers())
+    except Exception as exc:  # noqa: BLE001
+        cipher_count = f"unavailable: {type(exc).__name__}: {exc}"
+
+    return {
+        "configured_servers": list(clients),
+        "openssl_cipher_count": cipher_count,
+        "servers": servers,
+    }
 
 
 @mcp.tool()

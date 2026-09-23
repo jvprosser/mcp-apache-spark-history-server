@@ -18,6 +18,8 @@ from spark_history_mcp.tools.tools import (
     _calculate_executor_metrics,
     _filter_environment_section,
     _filter_threads,
+    _probe_diagnosis,
+    check_spark_connection,
     compare_sql_executions,
     compare_stages,
     get_client_or_default,
@@ -448,6 +450,79 @@ class TestTools(unittest.TestCase):
         self.assertEqual(result["active_executors"], 1)
         self.assertEqual(result["memory_used"], 7)
         self.assertEqual(result["disk_used"], 11)
+
+    # Tests for check_spark_connection tool
+    def test_probe_diagnosis_distinguishes_failure_modes(self):
+        """404/401/200 must each get a distinct, actionable sentence.
+
+        These are the three cases an agent would otherwise have to infer, and
+        the whole point of the tool is that it does not have to.
+        """
+        unreachable = _probe_diagnosis(
+            {
+                "error": "ConnectionRefusedError: nope",
+                "status": None,
+                "www_authenticate": None,
+            }
+        )
+        self.assertIn("Could not reach the server", unreachable)
+
+        wrong_path = _probe_diagnosis(
+            {"error": None, "status": 404, "www_authenticate": None}
+        )
+        self.assertIn("base URL is wrong", wrong_path)
+
+        spnego = _probe_diagnosis(
+            {"error": None, "status": 401, "www_authenticate": "Negotiate"}
+        )
+        self.assertIn("Negotiate", spnego)
+        self.assertIn("Knox gateway", spnego)
+
+        ok = _probe_diagnosis({"error": None, "status": 200, "www_authenticate": None})
+        self.assertEqual(ok, "Reachable and authorized.")
+
+    def test_probe_diagnosis_appends_no_ciphers_hint(self):
+        """The LIBRARY_HAS_NO_CIPHERS remedy must reach the caller."""
+        result = _probe_diagnosis(
+            {
+                "error": "SSLError: LIBRARY_HAS_NO_CIPHERS",
+                "status": None,
+                "www_authenticate": None,
+            }
+        )
+        self.assertIn("OpenSSL", result)
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    def test_check_spark_connection_reports_without_leaking_secrets(
+        self, mock_get_context
+    ):
+        """The report must carry the diagnosis and never the credentials."""
+        mock_context = MagicMock()
+        mock_context.request_context.lifespan_context.clients = {
+            "datahub": self.mock_client1
+        }
+        mock_get_context.return_value = mock_context
+
+        self.mock_client1.probe.return_value = {
+            "url": "https://gw.example/api/v1/version",
+            "status": 401,
+            "elapsed_ms": 42,
+            "www_authenticate": "Negotiate",
+            "error": None,
+        }
+        self.mock_client1.auth_summary.return_value = "basic(username=svc-spark)"
+
+        result = check_spark_connection()
+
+        self.assertEqual(result["configured_servers"], ["datahub"])
+        server = result["servers"][0]
+        self.assertFalse(server["authorized"])
+        self.assertTrue(server["connected"])
+        self.assertEqual(server["http_status"], 401)
+        self.assertIn("Negotiate", server["diagnosis"])
+        # auth_summary is the only channel auth details travel through, and it
+        # is username-only by construction.
+        self.assertNotIn("password", repr(result).lower())
 
     # Tests for list_applications tool
     @patch("spark_history_mcp.tools.tools.mcp.get_context")
