@@ -3,6 +3,8 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.environment import Environment
 from spark_history_mcp.api_client.models.executor import Executor
@@ -380,6 +382,7 @@ def list_applications(
     else:
         # Return from all servers
         all_apps = []
+        failures: list[str] = []
         clients = ctx.request_context.lifespan_context.clients
 
         for server_name, client in clients.items():
@@ -393,11 +396,27 @@ def list_applications(
                     limit=limit,
                 )
                 all_apps.extend(apps)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"Failed to get applications from server '{server_name}': {e}"
                 )
+                failures.append(f"{server_name}: {e}")
                 continue  # Skip unreachable servers
+
+        # "No applications exist" and "every server was unreachable" both used
+        # to return [] with isError=false, which is indistinguishable to the
+        # caller. An agent handed the second one has no way to know the data is
+        # missing rather than absent, and fills the silence by inventing an
+        # answer. Raise so the failure reaches the model.
+        #
+        # Partial success still returns data: one dead server among several
+        # should not mask the results from the live ones, and the warning above
+        # keeps the detail in the log.
+        if failures and not all_apps:
+            raise ToolError(
+                f"Could not reach any of the {len(failures)} configured Spark "
+                f"History Server(s): {'; '.join(failures)}"
+            )
 
         return all_apps
 

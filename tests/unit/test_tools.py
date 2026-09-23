@@ -2,6 +2,8 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+from mcp.server.fastmcp.exceptions import ToolError
+
 from spark_history_mcp.api.spark_client import SparkRestClient
 from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.environment import Environment
@@ -516,6 +518,49 @@ class TestTools(unittest.TestCase):
         result = list_applications()
 
         self.assertEqual(result, [])
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    def test_list_applications_all_servers_unreachable_raises(self, mock_get_context):
+        """Every server down must surface as an error, not an empty success.
+
+        The silent-[] version of this was indistinguishable from
+        test_list_applications_empty_result above, which left an agent no way to
+        tell "no applications" from "no connection".
+        """
+        mock_context = MagicMock()
+        mock_context.request_context.lifespan_context.clients = {
+            "server1": self.mock_client1,
+            "server2": self.mock_client2,
+        }
+        mock_get_context.return_value = mock_context
+
+        self.mock_client1.list_applications.side_effect = ConnectionError("refused")
+        self.mock_client2.list_applications.side_effect = ConnectionError("timed out")
+
+        with self.assertRaises(ToolError) as ctx:
+            list_applications()
+
+        message = str(ctx.exception)
+        self.assertIn("server1: refused", message)
+        self.assertIn("server2: timed out", message)
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    def test_list_applications_partial_failure_returns_data(self, mock_get_context):
+        """One dead server must not mask results from the live ones."""
+        mock_context = MagicMock()
+        mock_context.request_context.lifespan_context.clients = {
+            "server1": self.mock_client1,
+            "server2": self.mock_client2,
+        }
+        mock_get_context.return_value = mock_context
+
+        mock_apps = [MagicMock(spec=Application)]
+        self.mock_client1.list_applications.return_value = mock_apps
+        self.mock_client2.list_applications.side_effect = ConnectionError("refused")
+
+        result = list_applications()
+
+        self.assertEqual(result, mock_apps)
 
     @patch("spark_history_mcp.tools.tools.get_client_or_default")
     def test_list_applications_with_server(self, mock_get_client):
