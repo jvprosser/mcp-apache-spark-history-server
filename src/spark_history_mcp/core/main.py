@@ -7,7 +7,7 @@ import os
 import sys
 
 from spark_history_mcp.config.config import load_config, resolve_config_path
-from spark_history_mcp.core import app
+from spark_history_mcp.core import app, log_buffer
 
 # Configure logging
 logging.basicConfig(
@@ -30,6 +30,11 @@ def main():
         ),
     )
     args = parser.parse_args()
+
+    # Install before the first log call so the buffer captures startup too --
+    # the startup probe and the TLS cipher warning are exactly the records that
+    # are invisible on hosts that swallow stderr.
+    log_buffer.install()
 
     try:
         logger.info("Starting Spark History Server MCP...")

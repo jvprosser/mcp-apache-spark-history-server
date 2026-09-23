@@ -4,6 +4,7 @@ import ssl
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 
+from mcp.server.fastmcp import Context
 from mcp.server.fastmcp.exceptions import ToolError
 
 from spark_history_mcp.api_client.models.application import Application
@@ -12,6 +13,7 @@ from spark_history_mcp.api_client.models.executor import Executor
 from spark_history_mcp.api_client.models.job import Job
 from spark_history_mcp.api_client.models.sql_execution import SQLExecution
 from spark_history_mcp.api_client.models.stage_data import StageData
+from spark_history_mcp.core import log_buffer
 from spark_history_mcp.core.app import _probe_error_hint, mcp
 from spark_history_mcp.models.mcp_types import (
     FailedTask,
@@ -411,6 +413,45 @@ def check_spark_connection() -> dict:
         "configured_servers": list(clients),
         "openssl_cipher_count": cipher_count,
         "servers": servers,
+        # Everything this server logged, startup included. On a host that does
+        # not surface the subprocess's stderr this is the only way those
+        # records are reachable at all.
+        "recent_log": log_buffer.records(),
+    }
+
+
+@mcp.tool()
+async def check_mcp_logging(ctx: Context) -> dict:
+    """Test whether this MCP host forwards server log notifications.
+
+    Emits one ``notifications/message`` per severity level, then returns the
+    text of each. The returned values always reach you, because a tool result
+    is part of the protocol's response. The notifications only reach you if the
+    host chooses to forward them -- they are fire-and-forget, and this server
+    does not advertise the optional ``logging`` capability.
+
+    Read the result like this: if the marker strings appear ONLY inside this
+    JSON result, the host is dropping log notifications. If they also appear as
+    separate log lines elsewhere in the host's output, notifications work here
+    and the server can talk to you outside of tool results.
+    """
+    markers = {
+        level: f"MCP-LOG-PROBE {level} channel reached the host"
+        for level in ("debug", "info", "warning", "error")
+    }
+    await ctx.debug(markers["debug"])
+    await ctx.info(markers["info"])
+    await ctx.warning(markers["warning"])
+    await ctx.error(markers["error"])
+
+    return {
+        "notifications_sent": markers,
+        "how_to_read_this": (
+            "These four strings were each sent as an MCP notifications/message. "
+            "If you can see them only in this tool result, the host drops log "
+            "notifications. If they also appear as standalone log lines, the "
+            "notification channel works."
+        ),
     }
 
 

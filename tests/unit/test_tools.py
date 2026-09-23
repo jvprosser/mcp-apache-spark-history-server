@@ -1,6 +1,8 @@
+import asyncio
+import logging
 import unittest
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -13,12 +15,14 @@ from spark_history_mcp.api_client.models.sql_execution import SQLExecution
 from spark_history_mcp.api_client.models.stage_data import StageData
 from spark_history_mcp.api_client.models.task_metrics_summary import TaskMetricsSummary
 from spark_history_mcp.api_client.models.thread_stack_trace import ThreadStackTrace
+from spark_history_mcp.core import log_buffer
 from spark_history_mcp.tools.tools import (
     _build_stage_task_quantiles,
     _calculate_executor_metrics,
     _filter_environment_section,
     _filter_threads,
     _probe_diagnosis,
+    check_mcp_logging,
     check_spark_connection,
     compare_sql_executions,
     compare_stages,
@@ -523,6 +527,57 @@ class TestTools(unittest.TestCase):
         # auth_summary is the only channel auth details travel through, and it
         # is username-only by construction.
         self.assertNotIn("password", repr(result).lower())
+
+    @patch("spark_history_mcp.tools.tools.mcp.get_context")
+    def test_check_spark_connection_surfaces_buffered_log(self, mock_get_context):
+        """Buffered records must ride out in the result, not just to stderr."""
+        mock_context = MagicMock()
+        mock_context.request_context.lifespan_context.clients = {
+            "datahub": self.mock_client1
+        }
+        mock_get_context.return_value = mock_context
+        self.mock_client1.probe.return_value = {
+            "url": "https://gw.example/api/v1/version",
+            "status": 200,
+            "elapsed_ms": 7,
+            "www_authenticate": None,
+            "error": None,
+        }
+        self.mock_client1.auth_summary.return_value = "none"
+
+        log_buffer.reset()
+        log_buffer.install()
+        try:
+            logging.getLogger("spark_history_mcp.core.app").warning("startup probe ok")
+            result = check_spark_connection()
+        finally:
+            log_buffer.reset()
+
+        self.assertTrue(
+            any("startup probe ok" in line for line in result["recent_log"]),
+            f"buffered record missing from result: {result['recent_log']}",
+        )
+
+    def test_check_mcp_logging_emits_every_level_and_returns_markers(self):
+        """Each level must be sent as a notification and echoed in the result.
+
+        The echo is the point: the result is the only delivery the protocol
+        guarantees, so it is what lets the operator tell a dropped notification
+        from a tool that was never called.
+        """
+        ctx = MagicMock()
+        ctx.debug = AsyncMock()
+        ctx.info = AsyncMock()
+        ctx.warning = AsyncMock()
+        ctx.error = AsyncMock()
+
+        result = asyncio.run(check_mcp_logging(ctx))
+
+        for level in ("debug", "info", "warning", "error"):
+            getattr(ctx, level).assert_awaited_once()
+            sent = getattr(ctx, level).await_args.args[0]
+            self.assertIn("MCP-LOG-PROBE", sent)
+            self.assertEqual(result["notifications_sent"][level], sent)
 
     # Tests for list_applications tool
     @patch("spark_history_mcp.tools.tools.mcp.get_context")
