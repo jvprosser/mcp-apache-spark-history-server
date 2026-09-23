@@ -1,3 +1,4 @@
+import logging
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -11,8 +12,12 @@ from spark_history_mcp.api_client.models.application import Application
 from spark_history_mcp.api_client.models.application_attempt import ApplicationAttempt
 from spark_history_mcp.api_client.models.executor import Executor
 from spark_history_mcp.api_client.models.job import Job
-from spark_history_mcp.config.config import AuthConfig, ServerConfig
-from spark_history_mcp.core.app import _probe_error_hint, _probe_hint
+from spark_history_mcp.config.config import AuthConfig, Config, ServerConfig
+from spark_history_mcp.core.app import (
+    _probe_error_hint,
+    _probe_hint,
+    _warn_if_tls_unusable,
+)
 
 
 def _make_jobs(count):
@@ -143,6 +148,44 @@ class TestProbeErrorHint(unittest.TestCase):
             "ReadTimeoutError: Read timed out. (read timeout=30)",
         ):
             self.assertEqual(_probe_error_hint(error), "")
+
+
+class TestWarnIfTlsUnusable(unittest.TestCase):
+    """The empty-cipher warning fires without needing probe_on_startup."""
+
+    @staticmethod
+    def _config(url):
+        return Config(servers={"s": ServerConfig(url=url)})
+
+    def _warn_with_ciphers(self, url, ciphers):
+        """Run the check with a stubbed cipher list; return logged warnings."""
+        ctx = MagicMock()
+        ctx.get_ciphers.return_value = ciphers
+        with patch("ssl.create_default_context", return_value=ctx):
+            with self.assertLogs("spark_history_mcp.core.app", "WARNING") as logs:
+                # A no-op log guarantees assertLogs has a record either way,
+                # so "did not warn" is distinguishable from "warned".
+                logging.getLogger("spark_history_mcp.core.app").warning("sentinel")
+                _warn_if_tls_unusable(self._config(url))
+        return [m for m in logs.output if "sentinel" not in m]
+
+    def test_https_with_no_ciphers_warns_with_the_remedy(self):
+        warnings = self._warn_with_ciphers("https://gateway.example/spark3history", [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("OPENSSL_CONF", warnings[0])
+
+    def test_https_with_ciphers_stays_quiet(self):
+        warnings = self._warn_with_ciphers(
+            "https://gateway.example/spark3history",
+            [{"name": "TLS_AES_256_GCM_SHA384"}],
+        )
+        self.assertEqual(warnings, [])
+
+    def test_plain_http_is_never_checked(self):
+        # Local dev and the e2e corpus both run over plain HTTP; warning
+        # there would be noise on every startup.
+        warnings = self._warn_with_ciphers("http://localhost:18080", [])
+        self.assertEqual(warnings, [])
 
 
 class TestSparkRestClient(unittest.TestCase):

@@ -17,6 +17,17 @@
 #   Spark 2: https://<gateway-host>/<datahub-name>/cdp-proxy/sparkhistoryserver
 # Guessing wrong returns 404. A correct path returns 401 until you add
 # credentials -- that 401/404 distinction is the cheapest way to confirm it.
+#
+# Running under CML/CDSW (or any RHEL-family host) via uv/uvx: if every
+# request fails with
+#   [SSL: LIBRARY_HAS_NO_CIPHERS] library has no ciphers
+# the cause is the interpreter's OpenSSL, not anything in this file.
+# uv-managed CPython bundles its own OpenSSL but still reads the host
+# /etc/ssl/openssl.cnf, where a strict crypto policy can leave it with an
+# empty cipher list. Launch with OPENSSL_CONF=/dev/null, or use the system
+# interpreter (uvx --python /usr/bin/python3 ...). Note that verify_ssl and
+# ssl_ca_cert below cannot help -- the handshake fails before any
+# certificate is checked. If curl reaches the same URL, that confirms it.
 
 servers:
   datahub:

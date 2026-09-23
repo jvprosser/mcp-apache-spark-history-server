@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import ssl
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -21,6 +22,18 @@ from ..utils.utils import ApplicationDiscovery
 # skew (default 120s) decides whether an actual refresh happens; this only
 # bounds latency between "token about to expire" and "we noticed."
 _CDP_REFRESH_INTERVAL_SECONDS = 300
+
+# Shared by the startup TLS check and the probe's error hint: both diagnose
+# the same empty-cipher condition, one before any request and one after a
+# request has already failed.
+_NO_CIPHERS_REMEDY = (
+    "uv-managed CPython bundles its own OpenSSL but still reads the host "
+    "/etc/ssl/openssl.cnf, and a RHEL-family crypto policy (CDSW/CML included) "
+    "can leave it with an empty cipher list. Retry with OPENSSL_CONF=/dev/null, "
+    "or use the system interpreter (uvx --python /usr/bin/python3 ...). "
+    "verify_ssl and ssl_ca_cert will not help, since this fails before any "
+    "certificate is checked."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +72,7 @@ async def _app_lifespan_impl(server: FastMCP) -> AsyncIterator[AppContext]:
         list(config.servers.keys()),
         config.mcp.transport,
     )
+    _warn_if_tls_unusable(config)
 
     clients: dict[str, SparkRestClient] = {}
     default_client = None
@@ -138,9 +152,10 @@ async def _app_lifespan_impl(server: FastMCP) -> AsyncIterator[AppContext]:
             refresh_task.cancel()
             try:
                 await refresh_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                # Nothing above cares whether the loop shut down cleanly.
-                pass
+            except (asyncio.CancelledError, Exception) as exc:  # noqa: BLE001
+                # Nothing above cares whether the loop shut down cleanly, but
+                # swallowing it in silence would hide real teardown bugs.
+                logger.debug("CDP refresh task teardown: %s", exc)
 
 
 def _log_startup_probe(name: str, client: SparkRestClient) -> None:
@@ -203,16 +218,37 @@ def _probe_error_hint(error: str) -> str:
     if "LIBRARY_HAS_NO_CIPHERS" in error:
         return (
             "The TLS handshake offered no ciphers at all, which points at the "
-            "interpreter's OpenSSL rather than this server: uv-managed CPython "
-            "bundles its own OpenSSL but still reads the host "
-            "/etc/ssl/openssl.cnf, and a RHEL-family crypto policy (CDSW/CML "
-            "included) can leave it with an empty cipher list. Retry with "
-            "OPENSSL_CONF=/dev/null, or use the system interpreter "
-            "(uvx --python /usr/bin/python3 ...). If curl reaches this same "
-            "URL, that confirms it -- verify_ssl/ssl_ca_cert will not help, "
-            "since this fails before any certificate is checked."
+            f"interpreter's OpenSSL rather than this server: {_NO_CIPHERS_REMEDY} "
+            "If curl reaches this same URL, that confirms it."
         )
     return ""
+
+
+def _warn_if_tls_unusable(config: Config) -> None:
+    """Warn when HTTPS is configured but OpenSSL offers no ciphers at all.
+
+    An empty cipher list fails every HTTPS request with
+    LIBRARY_HAS_NO_CIPHERS. ``_probe_error_hint`` explains that once a
+    request has failed, but the probe is opt-in (``probe_on_startup``
+    defaults to False), so check it here too -- this way the diagnosis needs
+    no configuration to appear. Skipped when no server uses TLS, to keep
+    plain-HTTP local and e2e runs quiet.
+    """
+    if not any((s.url or "").startswith("https://") for s in config.servers.values()):
+        return
+    try:
+        ciphers = ssl.create_default_context().get_ciphers()
+    except Exception as exc:  # noqa: BLE001
+        # A default context that will not build is itself worth reporting,
+        # but it is not the empty-cipher case and gets no remedy text.
+        logger.warning("Could not inspect the OpenSSL cipher list: %s", exc)
+        return
+    if not ciphers:
+        logger.warning(
+            "OpenSSL reports no available ciphers, so every HTTPS request "
+            "will fail. %s",
+            _NO_CIPHERS_REMEDY,
+        )
 
 
 def _probe_hint(status: int, challenge: Optional[str]) -> str:
